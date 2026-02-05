@@ -22,6 +22,7 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
 from collections import defaultdict
 from enum import Enum
+import functools
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -1156,6 +1157,171 @@ def compute_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def compute_policy_loss_with_mask(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    rollout_log_prob: torch.Tensor | None = None,
+    topk_kl: torch.Tensor | None = None,
+    topk_tv: torch.Tensor | None = None,
+    entropy: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    loss_mode: Optional[str] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    if mask is None:
+        mask = _compute_token_mask_for_policy_loss(
+            rollout_log_prob=rollout_log_prob,
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            config=config,
+            loss_mode=loss_mode,
+            topk_kl=topk_kl,
+            topk_tv=topk_tv,
+        )
+    mask = mask.detach().float()
+
+    clip_ratio_c = config.get("clip_ratio_c", 10.0)
+    negative_approx_kl = log_prob - rollout_log_prob
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    ratio = torch.clamp(ratio, max=clip_ratio_c)
+    ratio = ratio.detach()
+
+    pg_losses = -advantages * ratio * mask * log_prob
+    pg_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+    )
+
+    valid_loss_mask = response_mask * (advantages != 0).float()
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    pg_clipfrac = verl_F.masked_mean(1.0 - mask.float(), valid_loss_mask)
+    pg_clipfrac_lower = verl_F.masked_mean((1.0 - mask.float()) * (advantages < 0).float(), valid_loss_mask)
+
+    invalid_tr_mask = (1.0 - mask.float()) * valid_loss_mask
+    invalid_tr_mask = invalid_tr_mask.bool()
+    invalid_tr_positive_advantage = torch.masked_select((advantages > 0).float(), invalid_tr_mask)
+    invalid_tr_negative_advantage = torch.masked_select((advantages < 0).float(), invalid_tr_mask)
+    invalid_tr_metrics = {}
+    invalid_tr_metrics[f"actor/invalid_tr_positive_advantage"] = invalid_tr_positive_advantage.detach().cpu().tolist()
+    invalid_tr_metrics[f"actor/invalid_tr_negative_advantage"] = invalid_tr_negative_advantage.detach().cpu().tolist()
+
+    positive_invalid_tr_mask = (advantages > 0) & invalid_tr_mask
+    negative_invalid_tr_mask = (advantages < 0) & invalid_tr_mask
+    invalid_tr_data = {
+        "log_prob": log_prob,
+        "prob": torch.exp(log_prob),
+        "rollout_log_prob": rollout_log_prob,
+        "rollout_prob": torch.exp(rollout_log_prob),
+        "ratio": ratio,
+        "topk_kl": topk_kl,
+        "entropy": entropy,
+    }
+    for key, val in invalid_tr_data.items():
+        data_positive = torch.masked_select(val, positive_invalid_tr_mask)
+        data_negative = torch.masked_select(val, negative_invalid_tr_mask)
+        invalid_tr_metrics[f"actor/invalid_tr_positive_{key}"] = data_positive.detach().cpu().tolist()
+        invalid_tr_metrics[f"actor/invalid_tr_negative_{key}"] = data_negative.detach().cpu().tolist()
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+    }
+    pg_metrics.update(invalid_tr_metrics)
+    return pg_loss, pg_metrics
+
+
+def _compute_token_mask_for_policy_loss(
+    rollout_log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[ActorConfig] = None,
+    loss_mode: Optional[str] = None,
+    topk_kl: torch.Tensor | None = None,
+    topk_tv: torch.Tensor | None = None,
+) -> torch.Tensor:
+    clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+    cliprange_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    cliprange_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+
+    prob = torch.exp(log_prob)
+    old_prob = torch.exp(old_log_prob)
+    rollout_prob = torch.exp(rollout_log_prob)
+    old_ratio = torch.exp(log_prob - old_log_prob)
+    rollout_ratio = torch.exp(log_prob - rollout_log_prob)
+
+    if loss_mode is None:
+        loss_mode = config.policy_loss.get("loss_mode", "dppo_binary_tv")
+    if loss_mode == "dppo_binary_kl":
+        kl = rollout_prob * (rollout_log_prob - log_prob) + (1 - rollout_prob) * torch.log((1.0 - rollout_prob + 1e-8) / (1.0 - prob + 1e-8))
+        invalid_positive_mask = (kl > cliprange_high) & (prob > rollout_prob)
+        invalid_negative_mask = (kl > cliprange_low) & (prob < rollout_prob)
+    elif loss_mode == "dppo_binary_kl_recompute":
+        kl = old_prob * (old_log_prob - log_prob) + (1 - old_prob) * torch.log((1.0 - old_prob + 1e-8) / (1.0 - prob + 1e-8))
+        invalid_positive_mask = (kl > cliprange_high) & (prob > old_prob)
+        invalid_negative_mask = (kl > cliprange_low) & (prob < old_prob)
+    elif loss_mode == "dppo_topk_kl":
+        invalid_positive_mask = (topk_kl > cliprange_high) & (prob > rollout_prob)
+        invalid_negative_mask = (topk_kl > cliprange_low) & (prob < rollout_prob)
+    elif loss_mode == "dppo_binary_tv":
+        invalid_positive_mask = (prob - rollout_prob) > cliprange_high
+        invalid_negative_mask = (prob - rollout_prob) < -cliprange_low
+    elif loss_mode == "dppo_binary_tv_recompute":
+        invalid_positive_mask = (prob - old_prob) > cliprange_high
+        invalid_negative_mask = (prob - old_prob) < -cliprange_low
+    elif loss_mode == "dppo_topk_tv":
+        invalid_positive_mask = (topk_tv > cliprange_high) & (prob > rollout_prob)
+        invalid_negative_mask = (topk_tv > cliprange_low) & (prob < rollout_prob)
+    elif loss_mode == "ppo":  # GRPO
+        invalid_positive_mask = rollout_ratio > 1 + cliprange_high
+        invalid_negative_mask = rollout_ratio < 1 - cliprange_low
+    elif loss_mode == "ppo_recompute":  # MiniRL
+        invalid_positive_mask = old_ratio > 1 + cliprange_high
+        invalid_negative_mask = old_ratio < 1 - cliprange_low
+    elif loss_mode == "ppo_ablation_positive":
+        invalid_positive_mask = (rollout_ratio > 1 + 0.28) & (rollout_prob >= cliprange_high)
+        invalid_negative_mask = rollout_ratio < 1 - cliprange_low
+    elif loss_mode == "ppo_ablation_negative":
+        invalid_positive_mask = rollout_ratio > 1 + cliprange_high
+        invalid_negative_mask = (rollout_ratio < 1 - 0.2) & (rollout_prob >= cliprange_low)
+    elif loss_mode == "ppo_ablation_both":
+        invalid_positive_mask = (rollout_ratio > 1 + 0.28) & (rollout_prob >= cliprange_high)
+        invalid_negative_mask = (rollout_ratio < 1 - 0.2) & (rollout_prob >= cliprange_low)
+    elif loss_mode == "pg_no_mask":  # CISPO
+        invalid_positive_mask = torch.zeros_like(prob)
+        invalid_negative_mask = torch.zeros_like(prob)
+    else:
+        raise ValueError(f"Invalid loss_mode: {loss_mode}")
+
+    invalid_mask = torch.where(advantages > 0, invalid_positive_mask, invalid_negative_mask)
+    valid_mask = 1.0 - invalid_mask.detach().float()
+    valid_mask = valid_mask * response_mask.float()
+    return valid_mask
+
+
+for _loss_mode in [
+    "dppo_binary_kl", "dppo_binary_kl_recompute", "dppo_topk_kl",
+    "dppo_binary_tv", "dppo_binary_tv_recompute", "dppo_topk_tv",
+    "ppo", "ppo_recompute",
+    "ppo_ablation_positive", "ppo_ablation_negative", "ppo_ablation_both",
+    "pg_no_mask",
+]:
+    POLICY_LOSS_REGISTRY[_loss_mode] = functools.partial(
+        compute_policy_loss_with_mask,
+        mask=None,
+        loss_mode=_loss_mode
+    )
+
+
 @register_policy_loss("vanilla")  # type: ignore[arg-type]
 def compute_policy_loss_vanilla(
     old_log_prob: torch.Tensor,
@@ -1165,6 +1331,8 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    rollout_log_prob: torch.Tensor | None = None,
+    **kwargs: Any,  # topk_kl, topk_tv, entropy
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.

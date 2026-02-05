@@ -298,17 +298,22 @@ class SGLangHttpServer:
             f"max_new_tokens {max_new_tokens} exceeds available context space {max_possible_tokens}"
         )
         sampling_params["max_new_tokens"] = max_new_tokens
-        return_logprob = sampling_params.pop("logprobs", False)
 
         request = {
             "rid": request_id,
             "input_ids": prompt_ids,
             "sampling_params": sampling_params,
-            "return_logprob": return_logprob,
             "image_data": image_data,
             # TODO: support video input for sglang
             # video_data=video_data,
         }
+        return_logprobs = sampling_params.pop("logprobs", False)
+        if isinstance(return_logprobs, int):
+            request["return_logprob"] = True
+            request["top_logprobs_num"] = return_logprobs
+        else:
+            assert isinstance(return_logprobs, bool), "logprobs must be a boolean or an integer"
+            request["return_logprob"] = return_logprobs
 
         if self.config.enable_rollout_routing_replay:
             request.update({"return_routed_experts": True})
@@ -316,11 +321,35 @@ class SGLangHttpServer:
         generate_request = GenerateReqInput(**request)
 
         output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
-        if return_logprob:
+        if request["return_logprob"]:
             output_token_logprobs = output["meta_info"]["output_token_logprobs"]
             log_probs, token_ids = zip(
                 *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
             )
+            resp_all_output_top_logprobs = []
+            resp_all_output_top_token_ids = []
+            output_top_logprobs = output["meta_info"].get("output_top_logprobs", [[] * len(token_ids)])
+            for token_id, log_prob, token_top_logprobs in zip(token_ids, log_probs, output_top_logprobs):
+                token_top_logprobs.sort(reverse=True)
+                token_all_top_token_ids = []
+                token_all_top_log_probs = []
+                sampled_token_in_topk = False
+
+                for _log_prob, _token_id, _ in token_top_logprobs:
+                    if (not sampled_token_in_topk) and (_token_id == token_id):
+                        sampled_token_in_topk = True
+                    token_all_top_token_ids.append(_token_id)
+                    token_all_top_log_probs.append(_log_prob)
+
+                if len(token_all_top_token_ids) == 0:
+                    token_all_top_token_ids.append(token_id)
+                    token_all_top_log_probs.append(log_prob)
+                elif not sampled_token_in_topk:
+                    token_all_top_token_ids[-1] = token_id
+                    token_all_top_log_probs[-1] = log_prob
+
+                resp_all_output_top_token_ids.append(token_all_top_token_ids)
+                resp_all_output_top_logprobs.append(token_all_top_log_probs)
         else:
             token_ids = output["output_ids"]
             log_probs = None
@@ -343,7 +372,13 @@ class SGLangHttpServer:
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
-        return TokenOutput(token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts)
+        return TokenOutput(
+            token_ids=token_ids, 
+            log_probs=log_probs, 
+            rollout_topk_token_ids=resp_all_output_top_token_ids,
+            rollout_topk_logprobs=resp_all_output_top_logprobs,
+            routed_experts=routed_experts,
+        )
 
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)

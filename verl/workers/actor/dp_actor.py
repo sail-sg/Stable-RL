@@ -20,6 +20,7 @@ Single Process Actor
 import logging
 import os
 
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -38,6 +39,7 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
+from verl.workers.actor.utils import compute_topk_kl
 from verl.workers.config import ActorConfig
 
 __all__ = ["DataParallelPPOActor"]
@@ -111,7 +113,9 @@ class DataParallelPPOActor(BasePPOActor):
             )
 
     def _forward_micro_batch(
-        self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
+        self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False,
+        rollout_topk_token_ids: torch.Tensor | None = None,
+        rollout_topk_logprobs: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Returns:
@@ -178,6 +182,37 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids_rmpad = index_first_axis(
                         rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
                     ).transpose(0, 1)
+                
+                if rollout_topk_token_ids is not None and rollout_topk_logprobs is not None:
+                    top_k = rollout_topk_token_ids.shape[-1]
+                    rollout_topk_token_ids_pad = torch.concat([
+                        torch.zeros(
+                            (batch_size, seqlen - response_length, top_k),
+                            device=rollout_topk_token_ids.device,
+                            dtype=rollout_topk_token_ids.dtype
+                        ),
+                        rollout_topk_token_ids], 
+                        dim=1
+                    )
+                    rollout_topk_token_ids_rmpad = index_first_axis(
+                        rearrange(rollout_topk_token_ids_pad, "b s ... -> (b s) ..."), 
+                        indices
+                    )  # (total_nnz, top_k)
+                    rollout_topk_token_ids_rmpad_rolled = torch.roll(rollout_topk_token_ids_rmpad, shifts=-1, dims=0)
+                    rollout_topk_logprobs_pad = torch.concat([
+                        torch.zeros(
+                            (batch_size, seqlen - response_length, top_k),
+                            device=rollout_topk_logprobs.device,
+                            dtype=rollout_topk_logprobs.dtype
+                        ),
+                        rollout_topk_logprobs], 
+                        dim=1
+                    )
+                    rollout_topk_logprobs_rmpad = index_first_axis(
+                        rearrange(rollout_topk_logprobs_pad, "b s ... -> (b s) ..."), 
+                        indices
+                    )  # (total_nnz, top_k)
+                    rollout_topk_logprobs_rmpad_rolled = torch.roll(rollout_topk_logprobs_rmpad, shifts=-1, dims=0)
 
                 is_mask_all_zero = attention_mask.sum() == 0
                 if is_mask_all_zero:
@@ -268,6 +303,9 @@ class DataParallelPPOActor(BasePPOActor):
                         inplace_backward=inplace_backward,
                     )
 
+                    if rollout_topk_token_ids is not None and rollout_topk_logprobs is not None:
+                        topk_kl, topk_tv = compute_topk_kl(logits_rmpad, rollout_topk_token_ids_rmpad_rolled, rollout_topk_logprobs_rmpad_rolled)
+
                     # compute entropy
                     if calculate_entropy:
                         # ((total_nnz / sp) + pad)
@@ -296,6 +334,19 @@ class DataParallelPPOActor(BasePPOActor):
                         unpad_dim=0,
                         padding_size=pad_size,
                     )
+                    if rollout_topk_token_ids is not None and rollout_topk_logprobs is not None:
+                        topk_kl = gather_outputs_and_unpad(
+                            topk_kl,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+                        topk_tv = gather_outputs_and_unpad(
+                            topk_tv,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
                     if calculate_entropy:
                         entropy_rmpad = gather_outputs_and_unpad(
                             entropy_rmpad,
@@ -310,6 +361,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if is_mask_all_zero:
                     log_probs = log_probs[:0]
+                    if rollout_topk_token_ids is not None and rollout_topk_logprobs is not None:
+                        topk_kl = topk_kl[:0]
+                        topk_tv = topk_tv[:0]
                     if calculate_entropy:
                         entropy_rmpad = entropy_rmpad[:0]
 
@@ -334,7 +388,21 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
-
+                if rollout_topk_token_ids is not None and rollout_topk_logprobs is not None:
+                    full_topk_kl = pad_input(
+                        hidden_states=topk_kl.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    self.topk_kl = full_topk_kl.squeeze(-1)[:, -response_length - 1 : -1]
+                    full_topk_tv = pad_input(
+                        hidden_states=topk_tv.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    self.topk_tv = full_topk_tv.squeeze(-1)[:, -response_length - 1 : -1]
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
@@ -526,6 +594,8 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+            select_keys.append("rollout_topk_token_ids")
+            select_keys.append("rollout_topk_logprobs")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
@@ -535,18 +605,22 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
-
-        # Split to make minibatch iterator for updating the actor
-        # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
-
-        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+        original_data = data
 
         metrics = {
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
         }
         for _ in range(self.config.ppo_epochs):
+            if self.use_ulysses_sp:
+                shuffled_data = original_data
+            else:
+                indices = np.random.permutation(len(original_data.batch))
+                shuffled_data = original_data.select_idxs(indices)
+            # Split to make minibatch iterator for updating the actor
+            # See PPO paper for details. https://arxiv.org/abs/1707.06347
+            mini_batches = shuffled_data.split(self.config.ppo_mini_batch_size)
+            on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -565,6 +639,9 @@ class DataParallelPPOActor(BasePPOActor):
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
+                    rollout_log_prob = model_inputs["rollout_log_probs"]
+                    rollout_topk_token_ids = model_inputs["rollout_topk_token_ids"]
+                    rollout_topk_logprobs = model_inputs["rollout_topk_logprobs"]
                     advantages = model_inputs["advantages"]
 
                     entropy_coeff = self.config.entropy_coeff
@@ -583,6 +660,8 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
+                    topk_kl = self.topk_kl
+                    topk_tv = self.topk_tv
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -613,8 +692,20 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        rollout_log_prob=rollout_log_prob,
+                        topk_kl=topk_kl,
+                        topk_tv=topk_tv,
+                        entropy=entropy,
                     )
                     micro_batch_metrics.update(pg_metrics)
+                    topk_kl_mean = verl_F.masked_mean(topk_kl, response_mask)
+                    topk_kl_max = (topk_kl * response_mask).max()
+                    topk_kl_less_01 = verl_F.masked_mean(topk_kl < 0.01, response_mask)
+                    topk_kl_less_05 = verl_F.masked_mean(topk_kl < 0.05, response_mask)
+                    micro_batch_metrics["actor/topk_kl_mean"] = topk_kl_mean.detach().item()
+                    micro_batch_metrics["actor/topk_kl_max"] = topk_kl_max.detach().item()
+                    micro_batch_metrics["actor/topk_kl_less_01"] = topk_kl_less_01.detach().item()
+                    micro_batch_metrics["actor/topk_kl_less_05"] = topk_kl_less_05.detach().item()
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
@@ -633,7 +724,7 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss = pg_loss
                     if calculate_entropy and entropy is not None:
                         entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                        micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
+                        micro_batch_metrics["actor/entropy_agg"] = entropy_agg.detach().item()
                         if entropy_coeff != 0:
                             policy_loss -= entropy_agg * entropy_coeff
 

@@ -140,6 +140,10 @@ class AgentLoopOutput(BaseModel):
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
+    rollout_topk_token_ids: Optional[list[list[int]]] = None
+    """Topk token ids of response tokens."""
+    rollout_topk_logprobs: Optional[list[list[float]]] = None
+    """Topk logprobs of response tokens."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
@@ -173,6 +177,10 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities for the response tokens."""
+    rollout_topk_token_ids: Optional[torch.Tensor] = None
+    """Padded topk token ids for the response tokens."""
+    rollout_topk_logprobs: Optional[torch.Tensor] = None
+    """Padded topk logprobs for the response tokens."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
@@ -575,9 +583,14 @@ class AgentLoopWorker:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
         response_logprobs = None
+        rollout_topk_token_ids = None
+        rollout_topk_logprobs = None
         if output.response_logprobs is not None:
             pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+            k = len(output.rollout_topk_token_ids[0])
+            rollout_topk_token_ids = torch.tensor(output.rollout_topk_token_ids + [[0] * k] * pad_size).unsqueeze(0)
+            rollout_topk_logprobs = torch.tensor(output.rollout_topk_logprobs + [[0.0] * k] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -627,6 +640,8 @@ class AgentLoopWorker:
             response_mask=response_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
+            rollout_topk_token_ids=rollout_topk_token_ids,
+            rollout_topk_logprobs=rollout_topk_logprobs,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
@@ -738,6 +753,8 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+            optional_outputs["rollout_topk_token_ids"] = torch.cat([input.rollout_topk_token_ids for input in inputs], dim=0)
+            optional_outputs["rollout_topk_logprobs"] = torch.cat([input.rollout_topk_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
 

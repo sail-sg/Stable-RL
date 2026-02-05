@@ -56,6 +56,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
+from verl.workers.actor.utils import compute_topk_kl
 
 __all__ = ["MegatronPPOActor"]
 
@@ -357,6 +358,8 @@ class MegatronPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+            select_keys.append("rollout_topk_token_ids")
+            select_keys.append("rollout_topk_logprobs")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         # router replay
         if self.enable_routing_replay:
@@ -452,9 +455,12 @@ class MegatronPPOActor(BasePPOActor):
             entropy = None
             if isinstance(output, dict):
                 log_probs = output["log_probs"]
+                topk_kl = output["topk_kl"]
+                topk_tv = output["topk_tv"]
                 if "entropy" in output:
                     entropy = output["entropy"]
             else:
+                assert False, "output must be a dict"
                 assert isinstance(output, torch.Tensor)
                 log_probs = output
 
@@ -476,10 +482,15 @@ class MegatronPPOActor(BasePPOActor):
             loss_agg_mode = self.config.loss_agg_mode
             # compute policy loss
             log_prob = log_probs[:, -response_length - 1 : -1].contiguous()
+            topk_kl = topk_kl[:, -response_length - 1 : -1].contiguous()
+            topk_tv = topk_tv[:, -response_length - 1 : -1].contiguous()
+            if entropy is not None:
+                entropy = entropy[:, -response_length - 1 : -1].contiguous()
             ret_entropy = None
             stats = {}
             if not forward_only:
                 old_log_prob = data["old_log_probs"]
+                rollout_log_prob = data["rollout_log_probs"]
                 advantages = data["advantages"]
 
                 entropy_coeff = self.config.entropy_coeff
@@ -500,6 +511,10 @@ class MegatronPPOActor(BasePPOActor):
                     loss_agg_mode=loss_agg_mode,
                     config=self.config,
                     rollout_is_weights=rollout_is_weights,
+                    rollout_log_prob=rollout_log_prob,
+                    topk_kl=topk_kl,
+                    topk_tv=topk_tv,
+                    entropy=entropy,
                 )
                 stats.update(pg_metrics)
 
@@ -624,10 +639,19 @@ class MegatronPPOActor(BasePPOActor):
             else:
                 forward_fn = get_mcore_forward_fn(self.hf_config)
 
-                def logits_processor(logits, label, label_mask):
+                def logits_processor(logits, label, label_mask, **kwargs):
                     assert logits.shape[:2] == label.shape[:2]
                     assert label.shape == label_mask.shape
                     logits.div_(temperature)
+
+                    rollout_topk_ids = kwargs.get("rollout_topk_ids", None)
+                    rollout_topk_logprobs = kwargs.get("rollout_topk_logprobs", None)
+                    topk_kl, topk_tv = compute_topk_kl(
+                        logits=logits,
+                        rollout_topk_token_ids=rollout_topk_ids,
+                        rollout_topk_logprobs=rollout_topk_logprobs,
+                    )
+
                     ret = {}
                     if calculate_entropy:
                         logits_bak = logits.clone()
@@ -644,9 +668,43 @@ class MegatronPPOActor(BasePPOActor):
                     log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret["log_probs"] = log_probs
+                    ret["topk_kl"] = topk_kl.masked_fill(~label_mask, 0.0)
+                    ret["topk_tv"] = topk_tv.masked_fill(~label_mask, 0.0)
                     return ret
 
-                logits_processor_args = {"label": label, "label_mask": label_mask}
+                seq_len = input_ids.shape[1]
+                bsz, resp_len, k = batch['rollout_topk_token_ids'].shape
+                assert resp_len == response_length
+                rollout_topk_ids = torch.concat(
+                    [
+                        torch.zeros(
+                            bsz, seq_len - resp_len, k,
+                            device=batch['rollout_topk_token_ids'].device, 
+                            dtype=batch['rollout_topk_token_ids'].dtype
+                        ),
+                        batch['rollout_topk_token_ids']
+                    ],
+                    axis=1
+                )
+                rollout_topk_ids = torch.roll(rollout_topk_ids, shifts=-1, dims=1)
+                rollout_topk_logprobs = torch.concat(
+                    [
+                        torch.zeros(
+                            bsz, seq_len - resp_len, k,
+                            device=batch['rollout_topk_logprobs'].device, 
+                            dtype=batch['rollout_topk_logprobs'].dtype
+                        ),
+                        batch['rollout_topk_logprobs']
+                    ],
+                    axis=1
+                )
+                rollout_topk_logprobs = torch.roll(rollout_topk_logprobs, shifts=-1, dims=1)
+
+                logits_processor_args = {
+                    "label": label, "label_mask": label_mask,
+                    "rollout_topk_ids": rollout_topk_ids,
+                    "rollout_topk_logprobs": rollout_topk_logprobs,
+                }
                 output = forward_fn(
                     model=model,
                     input_ids=input_ids,
@@ -755,7 +813,7 @@ class MegatronPPOActor(BasePPOActor):
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
                 chunk.zero_grad_buffer()
 
-            calculate_entropy = self.config.entropy_coeff != 0
+            calculate_entropy = True if self.config.entropy_coef != 0 else self.config.calculate_entropy
             if data.meta_info.get("micro_batch_size", None) is not None:
                 micro_batch_size = data.meta_info["micro_batch_size"]
             else:

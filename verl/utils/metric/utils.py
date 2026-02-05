@@ -53,6 +53,11 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, 
             metrics[key] = np.max(val)
         elif "min" in key:
             metrics[key] = np.min(val)
+        elif "invalid_tr_" in key:
+            if len(val) > 0 and isinstance(val[0], list):
+                metrics[key] = np.mean(sum(val, []))
+            elif len(val) > 0:
+                metrics[key] = np.mean(val)
         else:
             metrics[key] = np.mean(val)
     return metrics

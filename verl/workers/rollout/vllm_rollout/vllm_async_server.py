@@ -497,7 +497,16 @@ class vLLMHttpServer:
         assert max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+
+        return_logprobs = sampling_params.pop("logprobs", False)
+
+        if isinstance(return_logprobs, int):
+            sampling_params["logprobs"] = return_logprobs
+        else:
+            assert isinstance(return_logprobs, bool), "logprobs must be a boolean or an integer"
+            sampling_params["logprobs"] = 0 if return_logprobs else None
+        # sampling_params["logprobs"] = 1  ## hacked
+
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
@@ -533,6 +542,35 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            # Save top k (k = max(1, sampling_params.logprobs)) logprobs and the corresponding token_id, sorted by rank in ascending order.
+            k = max(1, sampling_params.logprobs)
+            rollout_topk_token_ids = []
+            rollout_topk_logprobs = []
+            for idx, (gen_token_id, logprobs_dict) in enumerate(zip(token_ids, final_res.outputs[0].logprobs)):
+                # logprobs_dict: {token_id: TopLogProb (with .logprob, .rank)}
+                topk_list = sorted(
+                    [(tid, lp.rank, lp.logprob) for tid, lp in logprobs_dict.items()],
+                    key=lambda tup: tup[1]
+                )[:k]
+
+                # Prepare set for quick lookup of top-k token_ids
+                topk_token_ids = {tid for tid, _, _ in topk_list}
+
+                # If sampled token not in top-k, replace last (rank==k-1) with sampled token
+                if gen_token_id not in topk_token_ids:
+                    # Find sampled token in logprobs_dict
+                    if gen_token_id in logprobs_dict:
+                        gen_lp = logprobs_dict[gen_token_id]
+                        # Replace last
+                        topk_list = topk_list[:-1] + [(gen_token_id, gen_lp.rank, gen_lp.logprob)]
+                        # Resort by rank again (in case)
+                        # topk_list = sorted(topk_list, key=lambda tup: tup[1])
+                    else:
+                        # If not present at all (should not happen), raise error
+                        raise ValueError(f"Sampled token {gen_token_id} not found in logprobs_dict")
+
+                rollout_topk_token_ids.append([tid for tid, _, _ in topk_list])
+                rollout_topk_logprobs.append([lp for _, _, lp in topk_list])
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -548,7 +586,12 @@ class vLLMHttpServer:
             stop_reason = finish_reason  # for more stop reason in the future
 
         return TokenOutput(
-            token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts, stop_reason=stop_reason
+            token_ids=token_ids,
+            log_probs=log_probs,
+            rollout_topk_token_ids=rollout_topk_token_ids,
+            rollout_topk_logprobs=rollout_topk_logprobs,
+            routed_experts=routed_experts,
+            stop_reason=stop_reason,
         )
 
     async def wake_up(self):
