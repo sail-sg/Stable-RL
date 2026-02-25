@@ -23,7 +23,7 @@ DPPO variants achieve stable training while controlling the training-inference m
 The plots show numerical differences between a training and an inference engine for Qwen3-30B-A3B-Base with identical parameters. **(Left)** The probability ratio (used in PPO) is highly volatile for low-probability tokens. **(Right)** In contrast, the TV divergence is more stable. This highlights a key flaw of PPO's clipping mechanism: it **over-penalizes low-probability tokens**, which can slow down learning; and **under-penalizes high-probability tokens**, which can permit large, destabilizing updates.
 
 ![](figures/clipped_tokens.png)
-The most frequently clipped tokens are important to the reasoning task! 
+The most frequently clipped tokens (by GRPO) are important to the reasoning task! 
 They are dominated by:
 - numbers, like 1, 4
 - mathematical symbols, like +, -, =
