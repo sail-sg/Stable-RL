@@ -10,6 +10,11 @@
 </div>
 
 
+## Updates
+
+* 26/2/2026: 🎉 VeRL has officially supported DPPO-Binary-TV and DPPO-Binary-KL. [PR](https://github.com/verl-project/verl/pull/5397), [doc](https://github.com/verl-project/verl/blob/main/examples/dppo_trainer/dppo.md), [example script](https://github.com/verl-project/verl/blob/main/examples/dppo_trainer/run_qwen30b_dppo.sh).
+
+
 ## Overview
 
 ![](figures/ppo_vs_dppo.jpg)
